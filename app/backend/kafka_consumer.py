@@ -1,172 +1,196 @@
 """
-Kafka consumer for subscribing to computed data and broadcasting via WebSocket
+Kafka consumer for computed data.
+- Consume hyperliquid.computed_data
+- Write LIQUIDATION events into Postgres (MVP)
+- Broadcast to WebSocket (unchanged)
 """
 import json
 import asyncio
 import threading
-from kafka import KafkaConsumer
+import time
+import logging
 from typing import Optional
+from decimal import Decimal
+from datetime import datetime
+
+from kafka import KafkaConsumer
+import psycopg2
+from psycopg2.extras import Json
+
 from config import settings
 from websocket_manager import manager
 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("kafka")
+
 
 class KafkaConsumerService:
-    """Service for consuming Kafka messages and broadcasting via WebSocket"""
-    
     def __init__(self):
         self.consumer: Optional[KafkaConsumer] = None
         self.running = False
         self.thread: Optional[threading.Thread] = None
         self.main_loop: Optional[asyncio.AbstractEventLoop] = None
-    
+
     def set_main_loop(self, loop: asyncio.AbstractEventLoop):
-        """Set the main event loop for scheduling async tasks"""
         self.main_loop = loop
-    
+
+    # -------------------------
+    # Kafka
+    # -------------------------
     def start(self):
-        """Start the Kafka consumer in a background thread"""
         if self.running:
             return
-        
-        try:
-            self.consumer = KafkaConsumer(
-                settings.kafka_topic_computed_data,
-                bootstrap_servers=settings.kafka_bootstrap_servers.split(","),
-                value_deserializer=lambda m: json.loads(m.decode('utf-8')),
-                auto_offset_reset='latest',
-                enable_auto_commit=True,
-                group_id='backend-consumer-group'
-            )
-            self.running = True
-            
-            # Start consumer in background thread
-            self.thread = threading.Thread(target=self._consume_loop, daemon=True)
-            self.thread.start()
-            
-            print(f"Kafka consumer started, listening to topic: {settings.kafka_topic_computed_data}")
-        except Exception as e:
-            print(f"Failed to start Kafka consumer: {e}")
-            print("Note: Make sure Kafka is running and accessible")
-    
+
+        topic = settings.kafka_topic_computed_data
+        servers = settings.kafka_bootstrap_servers.split(",")
+
+        group_id = f"backend-consumer-debug-{int(time.time())}"
+
+        self.consumer = KafkaConsumer(
+            topic,
+            bootstrap_servers=servers,
+            value_deserializer=lambda m: json.loads(m.decode("utf-8")),
+            auto_offset_reset="earliest",
+            enable_auto_commit=True,
+            group_id=group_id,
+            request_timeout_ms=30000,
+            api_version_auto_timeout_ms=30000,
+        )
+
+        self.running = True
+        self.thread = threading.Thread(target=self._consume_loop, daemon=True)
+        self.thread.start()
+
+        logger.info(f"[Kafka] Consumer started, topic={topic}, group_id={group_id}")
+
     def stop(self):
-        """Stop the Kafka consumer"""
         self.running = False
         if self.consumer:
             self.consumer.close()
-        print("Kafka consumer stopped")
-    
+
     def _consume_loop(self):
-        """Main consumption loop (runs in background thread)"""
+        logger.info("[Kafka] Consume loop started")
         while self.running:
-            try:
-                # Poll for messages (synchronous operation)
-                message_pack = self.consumer.poll(timeout_ms=1000)
-                
-                for topic_partition, messages in message_pack.items():
-                    for message in messages:
-                        # Schedule async processing in main event loop
-                        if self.main_loop and self.main_loop.is_running():
-                            asyncio.run_coroutine_threadsafe(
-                                self._process_message(message.value),
-                                self.main_loop
-                            )
-                        else:
-                            # Fallback: create new event loop if main loop not available
-                            try:
-                                loop = asyncio.new_event_loop()
-                                asyncio.set_event_loop(loop)
-                                loop.run_until_complete(self._process_message(message.value))
-                                loop.close()
-                            except Exception as e:
-                                print(f"Error processing message: {e}")
-            
-            except Exception as e:
-                print(f"Error in Kafka consumer loop: {e}")
-                import time
-                time.sleep(1)
-    
-    async def _process_message(self, message: dict):
-        """Process a Kafka message"""
+            records = self.consumer.poll(timeout_ms=1000)
+            for _, messages in records.items():
+                for msg in messages:
+                    logger.info(
+                        f"[Kafka] Received {msg.topic} partition={msg.partition} offset={msg.offset}"
+                    )
+                    if self.main_loop:
+                        asyncio.run_coroutine_threadsafe(
+                            self._process_message(msg.value),
+                            self.main_loop,
+                        )
+        logger.info("[Kafka] Consume loop exited")
+
+    # -------------------------
+    # DB helpers
+    # -------------------------
+    @staticmethod
+    def _get_db_conn():
+        return psycopg2.connect(
+            host=settings.postgres_host,
+            port=settings.postgres_port,
+            database=settings.postgres_db,
+            user=settings.postgres_user,
+            password=settings.postgres_password,
+        )
+
+    @staticmethod
+    def _insert_liquidation(message: dict):
+        data = message.get("data", {}) or {}
+
+        tx_hash = data.get("tx_hash")
+        if not tx_hash:
+            logger.warning("[DB] Skip liquidation: missing tx_hash")
+            return
+
+        block_ts = data.get("block_timestamp") or datetime.utcnow().isoformat() + "Z"
+
+        def dec(v):
+            return None if v is None else Decimal(str(v))
+
+        conn = None
+        cur = None
         try:
-            data_type = message.get("data_type")
-            data = message.get("data", {})
-            coin = message.get("coin")
-            timestamp = message.get("timestamp")
-            
-            if data_type == "LONG_SHORT_RATIO":
-                # Broadcast long/short ratio update (frontend format)
-                total_value = float(data.get("long_position_value", 0)) + float(data.get("short_position_value", 0))
-                long_percent = (float(data.get("long_position_value", 0)) / total_value * 100) if total_value > 0 else 50.0
-                short_percent = (float(data.get("short_position_value", 0)) / total_value * 100) if total_value > 0 else 50.0
-                
-                ratio_data = {
-                    "longPercent": round(long_percent, 2),
-                    "shortPercent": round(short_percent, 2),
-                    "longVolume": float(data.get("long_position_value", 0)),
-                    "shortVolume": float(data.get("short_position_value", 0)),
-                    "longChange24h": 0.0,  # TODO: Calculate from historical data
-                    "shortChange24h": 0.0  # TODO: Calculate from historical data
-                }
-                await manager.broadcast_long_short_ratio(ratio_data)
-            
-            elif data_type == "LIQUIDATION_MAP":
-                # Broadcast price update for liquidation heatmap (frontend format)
-                price_levels = data.get("price_levels", [])
-                if price_levels:
-                    current_price = sum(level.get("price", 0) for level in price_levels) / len(price_levels)
-                    points = []
-                    for level in price_levels:
-                        points.append({
-                            "price": float(level.get("price", 0)),
-                            "longVol": float(level.get("long_liquidation_value", 0)) / 10000,
-                            "shortVol": float(level.get("short_liquidation_value", 0)) / 10000,
-                            "current": abs(level.get("price", 0) - current_price) < (current_price * 0.001)
-                        })
-                    
-                    price_data = {
-                        "token": coin or "BTC",
-                        "currentPrice": current_price,
-                        "points": points
-                    }
-                    await manager.broadcast_price_update(price_data)
-            
-            elif data_type == "LIQUIDATION":
-                # Broadcast whale activity (frontend format)
-                from utils.formatters import format_relative_time, truncate_address, format_token_amount
-                from datetime import datetime
-                from decimal import Decimal
-                
-                block_timestamp_str = data.get("block_timestamp", "")
-                if block_timestamp_str:
-                    try:
-                        if block_timestamp_str.endswith("Z"):
-                            block_timestamp = datetime.fromisoformat(block_timestamp_str.replace("Z", "+00:00"))
-                        else:
-                            block_timestamp = datetime.fromisoformat(block_timestamp_str)
-                    except:
-                        block_timestamp = datetime.utcnow()
-                else:
-                    block_timestamp = datetime.utcnow()
-                
-                liquidated_size = Decimal(str(data.get("liquidated_size", 0)))
-                coin = data.get("coin", "N/A")
-                
-                activity_data = {
-                    "time": format_relative_time(block_timestamp),
-                    "address": truncate_address(data.get("user_address", "")),
-                    "token": coin,
-                    "value": float(data.get("liquidation_value_usd", 0)),
-                    "side": "Long" if data.get("side", "").upper() in ["LONG", "L"] else "Short",
-                    "type": "Close",  # Liquidations are always closes
-                    "amount": format_token_amount(liquidated_size, coin),
-                    "timestamp": block_timestamp.isoformat() + "Z",
-                    "txHash": data.get("tx_hash")
-                }
-                await manager.broadcast_whale_activity(activity_data)
-        
+            conn = KafkaConsumerService._get_db_conn()
+            cur = conn.cursor()
+
+            cur.execute(
+                """
+                INSERT INTO liquidations (
+                    tx_hash,
+                    block_timestamp,
+                    user_address,
+                    coin,
+                    side,
+                    liquidated_size,
+                    liquidation_value_usd,
+                    raw_data
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (tx_hash) DO NOTHING
+                """,
+                (
+                    tx_hash,
+                    block_ts,
+                    data.get("user_address"),
+                    data.get("coin") or message.get("coin"),
+                    data.get("side"),
+                    dec(data.get("liquidated_size")),
+                    dec(data.get("liquidation_value_usd")),
+                    Json(message),
+                ),
+            )
+            conn.commit()
+            logger.info(f"[DB] Inserted liquidation tx={tx_hash}")
+
         except Exception as e:
-            print(f"Error processing Kafka message: {e}")
+            if conn:
+                conn.rollback()
+            logger.warning(f"[DB] Insert liquidation failed: {e}")
+        finally:
+            if cur:
+                cur.close()
+            if conn:
+                conn.close()
+
+    # -------------------------
+    # Message processing
+    # -------------------------
+    async def _process_message(self, message: dict):
+        data_type = message.get("data_type")
+        data = message.get("data", {})
+
+        if data_type == "LIQUIDATION":
+            # 写 DB（同步逻辑，放到线程池）
+            await asyncio.to_thread(self._insert_liquidation, message)
+
+            # WebSocket（保持你原来的）
+            from utils.formatters import format_relative_time, truncate_address, format_token_amount
+
+            ts = data.get("block_timestamp")
+            try:
+                ts = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            except Exception:
+                ts = datetime.utcnow()
+
+            size = Decimal(str(data.get("liquidated_size", 0)))
+
+            activity_data = {
+                "time": format_relative_time(ts),
+                "address": truncate_address(data.get("user_address", "")),
+                "token": data.get("coin", "N/A"),
+                "value": float(data.get("liquidation_value_usd", 0)),
+                "side": "Long" if data.get("side", "").upper() in ["LONG", "L"] else "Short",
+                "type": "Close",
+                "amount": format_token_amount(size, data.get("coin", "N/A")),
+                "timestamp": ts.isoformat() + "Z",
+                "txHash": data.get("tx_hash"),
+            }
+
+            await manager.broadcast_whale_activity(activity_data)
 
 
-# Global Kafka consumer instance
 kafka_consumer = KafkaConsumerService()

@@ -41,24 +41,28 @@ class MessageProducer:
         else:
             print("✓ Running in DRY_RUN mode (messages will only be printed)")
     
-    def send_message(self, message: Dict[str, Any]) -> bool:
+    def send_message(self, message: Dict[str, Any], topic: Optional[str] = None) -> bool:
         """
         Send a message to Kafka or print it in dry-run mode
         
         Args:
             message: Message dict to send
+            topic: Target topic name. If None, uses default topic (backward compatible)
             
         Returns:
             True if successful, False otherwise
         """
+        # Use provided topic or fall back to default
+        target_topic = topic if topic is not None else self.topic
+        
         try:
             if self.dry_run:
-                print(f"\n[DRY_RUN] Would send to topic '{self.topic}':")
+                print(f"\n[DRY_RUN] Would send to topic '{target_topic}':")
                 print(json.dumps(message, indent=2, ensure_ascii=False))
                 return True
             
             if self.producer:
-                future = self.producer.send(self.topic, message)
+                future = self.producer.send(target_topic, message)
                 # Wait for send to complete
                 record_metadata = future.get(timeout=10)
                 print(f"✓ Sent message to {record_metadata.topic}[{record_metadata.partition}] @ offset {record_metadata.offset}")
@@ -68,7 +72,7 @@ class MessageProducer:
                 return False
                 
         except Exception as e:
-            print(f"✗ Error sending message: {e}")
+            print(f"✗ Error sending message to {target_topic}: {e}")
             return False
     
     def flush(self):

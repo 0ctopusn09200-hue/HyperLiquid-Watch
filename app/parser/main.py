@@ -6,6 +6,7 @@ import asyncio
 import os
 import signal
 import sys
+from collections import deque
 from datetime import datetime, timezone
 from decimal import Decimal
 import hashlib
@@ -86,6 +87,9 @@ class ParserService:
         if self.enable_price_feed:
             print(f"  → Prices will be sent to: {self.kafka_topic_prices}")
         print("="*60 + "\n")
+        
+        self._seen = set()
+        self._seen_q = deque(maxlen=50000)
     
     def _build_subscriptions(self) -> list:
         """
@@ -171,138 +175,105 @@ class ParserService:
         # Process each trade
         for trade in trades_data:
             parsed_msg = self.parse_trade(trade, data)
-            if parsed_msg:
-                # Send to default topic (backward compatible - no topic override)
-                success = self.producer.send_message(parsed_msg)
-                if success:
-                    self.message_count += 1
+            if not parsed_msg:
+                continue
+            
+            txh = parsed_msg.get("tx_hash")
+            if txh in self._seen:
+                continue
+            self._seen.add(txh)
+            self._seen_q.append(txh)
+            
+            if len(self._seen_q) == self._seen_q.maxlen:
+                self._seen = set(self._seen_q)
+            
+            # Send to default topic (backward compatible - no topic override)
+            success = self.producer.send_message(parsed_msg)
+            if success:
+                self.message_count += 1
     
     def parse_trade(self, trade: Dict[str, Any], raw_data: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Parse a single trade into the required schema format
-        
-        Schema reference (docs/data_schemas.md):
-        - tx_hash: string (unique identifier)
-        - block_number: integer
-        - block_timestamp: string (ISO 8601)
-        - user_address: string
-        - coin: string
-        - side: string (LONG/SHORT/OPEN/CLOSE)
-        - size: string (decimal)
-        - price: string (decimal)
-        - leverage: string (decimal, optional)
-        - margin: string (decimal, optional)
-        - fee: string (decimal, optional)
-        - tx_type: string (ORDER/LIQUIDATION/etc)
-        - raw_data: object (original data)
-        
-        Args:
-            trade: Single trade data from WebSocket
-            raw_data: Complete raw message for reference
-            
-        Returns:
-            Parsed message dict matching schema
+        Clean trade message for downstream computation.
+        Downstream only needs: Price, Volume(Size), Side(BUY/SELL), Wallet Address + timestamp/id.
         """
         try:
-            # Generate tx_hash from trade data
+            def to_decimal(value) -> Decimal:
+                return Decimal(str(value))
+
+            # --- stable id ---
             trade_str = json.dumps(trade, sort_keys=True)
             tx_hash = "0x" + hashlib.sha256(trade_str.encode()).hexdigest()
-            
-            # Extract trade fields with fallbacks
-            # Common fields in Hyperliquid trades: px (price), sz (size), side, time
-            price_raw = trade.get("px", trade.get("price", "0"))
-            size_raw = trade.get("sz", trade.get("size", "0"))
-            side_raw = trade.get("side", "").upper()
-            timestamp_ms = trade.get("time", None)
-            
-            # Convert side to schema format
-            if side_raw in ["B", "BUY", "LONG"]:
-                side = "LONG"
-            elif side_raw in ["A", "S", "SELL", "SHORT"]:
-                side = "SHORT"
+
+            # --- required raw fields ---
+            price_raw = trade.get("px", trade.get("price"))
+            size_raw = trade.get("sz", trade.get("size"))
+            side_raw = str(trade.get("side", "")).upper()
+            timestamp_ms = trade.get("time")
+
+            if price_raw is None or size_raw is None or not side_raw:
+                return None
+
+            # --- normalize numbers (Decimal for precision) ---
+            price_dec = to_decimal(price_raw)
+            size_dec = to_decimal(size_raw)
+            if price_dec <= 0 or size_dec <= 0:
+                return None
+
+            price = format(price_dec, "f")
+            size = format(size_dec, "f")
+            value_usd = format(price_dec * size_dec, "f")
+
+            # --- side semantics: BUY/SELL only ---
+            if side_raw in ["B", "BUY"]:
+                side = "BUY"
+            elif side_raw in ["A", "S", "SELL"]:
+                side = "SELL"
             else:
-                side = "OPEN"
-            
-            # Format timestamp
+                return None
+
+            # --- timestamp ---
             if timestamp_ms:
                 try:
                     dt = datetime.fromtimestamp(int(timestamp_ms) / 1000, tz=timezone.utc)
-                    block_timestamp = dt.strftime("%Y-%m-%dT%H:%M:%S") + "Z"
-                except:
-                    block_timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S") + "Z"
+                    timestamp = dt.strftime("%Y-%m-%dT%H:%M:%S") + "Z"
+                except Exception:
+                    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S") + "Z"
             else:
-                block_timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S") + "Z"
-            
-            # Convert numeric values to decimal strings
-            def to_decimal_str(value, default="0"):
-                try:
-                    return str(Decimal(str(value)))
-                except:
-                    return default
-            
-            price = to_decimal_str(price_raw, "0")
-            size = to_decimal_str(size_raw, "0")
-            
-            # Calculate fee if available (typically a small percentage)
-            fee_raw = trade.get("fee")
-            if fee_raw:
-                fee = to_decimal_str(fee_raw, "0")
-            else:
-                # Estimate fee as 0.025% of notional value (typical for spot)
-                try:
-                    notional = Decimal(price) * Decimal(size)
-                    fee = str(notional * Decimal("0.00025"))
-                except:
-                    fee = "0"
-            
-            # ========== EXISTING FIELDS (UNCHANGED - DO NOT MODIFY) ==========
-            # Build the message according to schema
-            message = {
-                "tx_hash": tx_hash,
-                "block_number": 0,  # Not available in trades data
-                "block_timestamp": block_timestamp,
-                "user_address": trade.get("user", trade.get("address", "UNKNOWN")),
-                "coin": trade.get("coin", self.coin),
-                "side": side,
-                "size": size,
-                "price": price,
-                "leverage": to_decimal_str(trade.get("leverage"), None) if "leverage" in trade else None,
-                "margin": to_decimal_str(trade.get("margin"), None) if "margin" in trade else None,
-                "fee": fee,
-                "tx_type": "ORDER",
-                "raw_data": trade  # Preserve original trade data
-            }
-            
-            # ========== NEW FIELDS (OPTIONAL - APPENDED AT END) ==========
-            # Extract additional fields for semantic clarity
-            # These fields can be safely ignored by old consumers
-            
-            # Correct order direction semantics (BUY/SELL vs LONG/SHORT)
-            if side_raw in ["B", "BUY"]:
-                message["order_side"] = "BUY"
-            elif side_raw in ["A", "S", "SELL"]:
-                message["order_side"] = "SELL"
-            else:
-                message["order_side"] = "UNKNOWN"
-            
-            # Extract buyer/seller addresses from users array
+                timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S") + "Z"
+
+            # --- wallet address ---
+            address = trade.get("user") or trade.get("address")
             users = trade.get("users", [])
-            if len(users) > 0:
-                message["buyer_address"] = users[0]
-            if len(users) > 1:
-                message["seller_address"] = users[1]
-            
-            # Hyperliquid native identifiers
+            if not address and isinstance(users, list):
+                if side == "BUY" and len(users) >= 1:
+                    address = users[0]
+                elif side == "SELL" and len(users) >= 2:
+                    address = users[1]
+            if not address:
+                address = "UNKNOWN"
+
+            msg = {
+                "tx_hash": tx_hash,
+                "timestamp": timestamp,
+                "token": trade.get("coin", self.coin),
+                "side": side,
+                "price": price,
+                "size": size,
+                "value_usd": value_usd,
+                "address": address,
+            }
+
             if "tid" in trade:
-                message["trade_id"] = trade["tid"]
+                msg["trade_id"] = trade["tid"]
             if "hash" in trade:
-                message["trade_hash"] = trade["hash"]
-            
-            # Remove None values for optional fields
-            message = {k: v for k, v in message.items() if v is not None}
-            
-            return message
-        
+                msg["trade_hash"] = trade["hash"]
+
+            # DEBUG: Print cleaned trade message from parse_trade
+            print(f"[DEBUG parse_trade] Cleaned JSON: {json.dumps(msg, indent=2, ensure_ascii=False)}")
+
+            return msg
+
         except Exception as e:
             print(f"✗ Error parsing trade: {e}")
             import traceback

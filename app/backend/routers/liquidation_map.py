@@ -1,40 +1,23 @@
-"""
-Liquidation map API routes
-"""
-from fastapi import APIRouter, Depends, Query
-from sqlalchemy.orm import Session
-from typing import Optional
-from datetime import datetime
+from fastapi import APIRouter, Query
 from decimal import Decimal
-from database import get_db
-from services import liquidation_map_service
-from schemas import ApiResponse
+from typing import Optional
 
-router = APIRouter(prefix="/liquidation-map", tags=["liquidation-map"])
+from services.liquidation_map_service import get_liquidation_map
+
+router = APIRouter()
 
 
-@router.get("")
-async def get_liquidation_map(
-    coin: str = Query(..., description="Coin symbol"),
-    timestamp: Optional[datetime] = Query(None, description="Specific timestamp, latest if not provided"),
-    price_range: Optional[str] = Query(None, description="Price range in format 'min,max'"),
-    db: Session = Depends(get_db)
+@router.get("/liquidation-map")
+def liquidation_map(
+    coin: str = Query(..., description="e.g. BTC"),
+    window_seconds: int = Query(3600, ge=60, le=86400),
+    step: Optional[float] = Query(None, description="price bucket step, e.g. 50 for BTC"),
+    limit_levels: int = Query(200, ge=10, le=2000),
 ):
-    """Get liquidation map for a coin"""
-    price_min = None
-    price_max = None
-    
-    if price_range:
-        try:
-            parts = price_range.split(",")
-            if len(parts) == 2:
-                price_min = Decimal(parts[0].strip()) if parts[0].strip() else None
-                price_max = Decimal(parts[1].strip()) if parts[1].strip() else None
-        except Exception:
-            pass
-    
-    map_data = liquidation_map_service.get_liquidation_map(
-        db, coin, timestamp, price_min, price_max
+    data = get_liquidation_map(
+        coin=coin,
+        window_seconds=window_seconds,
+        step=Decimal(str(step)) if step is not None else None,
+        limit_levels=limit_levels,
     )
-    
-    return ApiResponse(data=map_data.model_dump())
+    return {"code": 200, "message": "success", "data": data}

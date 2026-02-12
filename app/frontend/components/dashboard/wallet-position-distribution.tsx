@@ -1,126 +1,11 @@
+"use client"
+
+import { useEffect, useState } from "react"
+import { wsClient } from "@/lib/websocket"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
-
-interface WalletData {
-  positionSize: string
-  category: string
-  categoryEn: string
-  walletCount: number
-  openInterestPercent: number
-  longValue: string
-  shortValue: string
-  longPercent: number
-  profitUsers: number
-  lossUsers: number
-  sentiment: "bullish" | "bearish" | "neutral"
-}
-
-const walletData: WalletData[] = [
-  {
-    positionSize: "$0 - $250",
-    category: "Shrimp",
-    categoryEn: "Shrimp",
-    walletCount: 245912,
-    openInterestPercent: 8.64,
-    longValue: "$717M",
-    shortValue: "$181M",
-    longPercent: 80,
-    profitUsers: 8107,
-    lossUsers: 13128,
-    sentiment: "bearish",
-  },
-  {
-    positionSize: "$250 - $1K",
-    category: "Fish",
-    categoryEn: "Fish",
-    walletCount: 44488,
-    openInterestPercent: 52.21,
-    longValue: "$1.21B",
-    shortValue: "$401M",
-    longPercent: 75,
-    profitUsers: 10644,
-    lossUsers: 13625,
-    sentiment: "bearish",
-  },
-  {
-    positionSize: "$1K - $5K",
-    category: "Dolphin",
-    categoryEn: "Dolphin",
-    walletCount: 7407,
-    openInterestPercent: 62.42,
-    longValue: "$2.09B",
-    shortValue: "$801M",
-    longPercent: 72,
-    profitUsers: 2080,
-    lossUsers: 2544,
-    sentiment: "bearish",
-  },
-  {
-    positionSize: "$5K - $10K",
-    category: "Shark",
-    categoryEn: "Shark",
-    walletCount: 1755,
-    openInterestPercent: 65.3,
-    longValue: "$1.44B",
-    shortValue: "$499M",
-    longPercent: 74,
-    profitUsers: 529,
-    lossUsers: 619,
-    sentiment: "bearish",
-  },
-  {
-    positionSize: "$10K - $50K",
-    category: "Small Whale",
-    categoryEn: "Small Whale",
-    walletCount: 2062,
-    openInterestPercent: 72.9,
-    longValue: "$4.77B",
-    shortValue: "$4.04B",
-    longPercent: 54,
-    profitUsers: 802,
-    lossUsers: 701,
-    sentiment: "bullish",
-  },
-  {
-    positionSize: "$50K - $100K",
-    category: "Whale",
-    categoryEn: "Whale",
-    walletCount: 346,
-    openInterestPercent: 78.33,
-    longValue: "$2.21B",
-    shortValue: "$2.56B",
-    longPercent: 46,
-    profitUsers: 150,
-    lossUsers: 108,
-    sentiment: "bullish",
-  },
-  {
-    positionSize: "$100K - $1M",
-    category: "Humpback",
-    categoryEn: "Humpback",
-    walletCount: 392,
-    openInterestPercent: 82.15,
-    longValue: "$7.19B",
-    shortValue: "$9.10B",
-    longPercent: 44,
-    profitUsers: 186,
-    lossUsers: 136,
-    sentiment: "bullish",
-  },
-  {
-    positionSize: "$1M - $50M",
-    category: "Giant",
-    categoryEn: "Giant",
-    walletCount: 94,
-    openInterestPercent: 87.24,
-    longValue: "$17.31B",
-    shortValue: "$19.01B",
-    longPercent: 48,
-    profitUsers: 55,
-    lossUsers: 27,
-    sentiment: "bullish",
-  },
-]
+import { apiClient } from "@/lib/api"
+import type { WalletPositionBucket, WalletPositionDistributionResponse } from "@/lib/types/api"
 
 function SplitBar({
   leftValue,
@@ -154,12 +39,89 @@ function SplitBar({
 }
 
 export function WalletPositionDistribution() {
+  const [buckets, setBuckets] = useState<WalletPositionBucket[]>([])
+  const [totalWallets, setTotalWallets] = useState<number>(0)
+  const [loading, setLoading] = useState<boolean>(true)
+  const [error, setError] = useState<string | null>(null)
+
+  useEffect(() => {
+    let cancelled = false
+
+    async function load() {
+      try {
+        setError(null)
+        const data: WalletPositionDistributionResponse = await apiClient.getWalletDistribution()
+        if (cancelled) return
+        setBuckets(data.buckets || [])
+        setTotalWallets(data.totalWallets || 0)
+        setLoading(false)
+      } catch (e: any) {
+        if (cancelled) return
+        setError(e?.message || e?.detail || "Failed to load")
+        setLoading(false)
+      }
+    }
+
+    load()
+    const t = setInterval(load, 10000)
+    
+    // WebSocket: trigger reload when relevant realtime updates arrive
+    let unsubPrice: (() => void) | undefined
+    let unsubRatio: (() => void) | undefined
+    let unsubConnected: (() => void) | undefined
+
+    const connectAndSubscribe = async () => {
+      try {
+        await wsClient.connect()
+        if (wsClient.isConnected()) {
+          // Subscribe to price/ratio updates which may affect distribution view
+          wsClient.subscribe(["price_updates", "long_short_ratio"])
+        }
+      } catch (err) {
+        console.error("WalletPositionDistribution: WebSocket connect failed", err)
+      }
+    }
+
+    connectAndSubscribe()
+
+    unsubPrice = wsClient.onMessage("price_update", () => {
+      // refresh distribution on any price update
+      void load()
+    })
+
+    unsubRatio = wsClient.onMessage("long_short_ratio", () => {
+      // refresh distribution when ratio updates
+      void load()
+    })
+
+    unsubConnected = wsClient.onMessage("connected", () => {
+      if (wsClient.isConnected()) wsClient.subscribe(["price_updates", "long_short_ratio"])
+    })
+    return () => {
+      cancelled = true
+      clearInterval(t)
+      unsubPrice?.()
+      unsubRatio?.()
+      unsubConnected?.()
+    }
+  }, [])
+
   return (
     <Card className="bg-zinc-900 border-zinc-800">
       <CardHeader className="pb-3">
-        <CardTitle className="text-zinc-100 text-lg font-medium">Hyperliquid 钱包仓位实时分布</CardTitle>
+        <div className="flex items-center justify-between">
+          <CardTitle className="text-zinc-100 text-lg font-medium">Hyperliquid 钱包仓位实时分布</CardTitle>
+          <span className="text-[11px] text-zinc-500">
+            {loading ? "Loading..." : `Total wallets: ${totalWallets.toLocaleString()}`}
+          </span>
+        </div>
       </CardHeader>
       <CardContent className="p-0">
+        {error && (
+          <div className="px-3 py-2 text-xs text-rose-400">
+            Failed to load wallet distribution: {String(error)}
+          </div>
+        )}
         <div className="overflow-x-auto">
           <table className="w-full text-xs">
             <thead>
@@ -177,8 +139,9 @@ export function WalletPositionDistribution() {
               </tr>
             </thead>
             <tbody>
-              {walletData.map((row, index) => {
-                const profitPercent = Math.round((row.profitUsers / (row.profitUsers + row.lossUsers)) * 100)
+              {buckets.map((row, index) => {
+                const totalUsers = row.profitUsers + row.lossUsers
+                const profitPercent = totalUsers > 0 ? Math.round((row.profitUsers / totalUsers) * 100) : 0
                 return (
                   <tr
                     key={row.positionSize}
@@ -214,12 +177,16 @@ export function WalletPositionDistribution() {
 
                     {/* Long Value */}
                     <td className="px-3 py-2.5">
-                      <span className="text-emerald-400 font-mono font-medium">{row.longValue}</span>
+                      <span className="text-emerald-400 font-mono font-medium">
+                        {row.longValue}
+                      </span>
                     </td>
 
                     {/* Short Value */}
                     <td className="px-3 py-2.5">
-                      <span className="text-rose-400 font-mono font-medium">{row.shortValue}</span>
+                      <span className="text-rose-400 font-mono font-medium">
+                        {row.shortValue}
+                      </span>
                     </td>
 
                     {/* Long vs Short Split Bar */}

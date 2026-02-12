@@ -6,8 +6,24 @@ import type {
   ApiError,
 } from "./types/api";
 
-const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8080";
+// frontend/lib/api.ts
+
+const PUBLIC_API_BASE =
+  process.env.NEXT_PUBLIC_API_URL || "http://localhost:8080";
+
+// 给“容器内部 / SSR”用：走 docker compose 的 service name
+const INTERNAL_API_BASE =
+  process.env.API_INTERNAL_URL || "http://backend:8080";
+
+// 关键：服务器端(容器里)用 INTERNAL，浏览器端用 PUBLIC
+const API_BASE_URL = typeof window === "undefined"
+  ? INTERNAL_API_BASE
+  : PUBLIC_API_BASE;
+
 const API_PREFIX = "/api/v1";
+
+export const BASE_URL = `${API_BASE_URL}${API_PREFIX}`;
+
 
 /**
  * API client for Hyperliquid data analysis backend

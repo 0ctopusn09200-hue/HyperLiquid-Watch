@@ -1,16 +1,20 @@
 """
 Pydantic schemas for request/response validation
+FINAL — compatible with Plan A realtime ratios
 """
 from pydantic import BaseModel, Field
-from typing import Optional, List
-from datetime import datetime
+from typing import Optional, List, Dict, Any
+from datetime import datetime, timezone
 from decimal import Decimal
+
+
+def _utc_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 # ========== Common Schemas ==========
 
 class PaginationInfo(BaseModel):
-    """Pagination information"""
     page: int
     page_size: int
     total: int
@@ -18,25 +22,22 @@ class PaginationInfo(BaseModel):
 
 
 class ApiResponse(BaseModel):
-    """Standard API response format"""
     code: int = 200
     message: str = "success"
-    data: Optional[dict] = None
-    timestamp: str = Field(default_factory=lambda: datetime.utcnow().isoformat() + "Z")
+    data: Optional[Dict[str, Any]] = None
+    timestamp: str = Field(default_factory=_utc_iso)
 
 
 class PaginatedResponse(BaseModel):
-    """Paginated response format"""
     code: int = 200
     message: str = "success"
-    data: dict
-    timestamp: str = Field(default_factory=lambda: datetime.utcnow().isoformat() + "Z")
+    data: Dict[str, Any]
+    timestamp: str = Field(default_factory=_utc_iso)
 
 
 # ========== Liquidation Schemas ==========
 
 class LiquidationResponse(BaseModel):
-    """Liquidation event response"""
     tx_hash: str
     block_number: int
     block_timestamp: datetime
@@ -55,29 +56,27 @@ class LiquidationResponse(BaseModel):
 
 
 class LiquidationStatsResponse(BaseModel):
-    """Liquidation statistics response"""
     total_liquidations: int
     total_liquidation_value_usd: Decimal
     long_liquidations: int
     long_liquidation_value_usd: Decimal
     short_liquidations: int
     short_liquidation_value_usd: Decimal
-    by_coin: dict
+    by_coin: Dict[str, Any]
 
 
-# ========== Long/Short Ratio Schemas ==========
+# ========== Long/Short Ratio Schemas (Plan A realtime) ==========
 
 class LongShortRatioResponse(BaseModel):
-    """Long/Short ratio response"""
+    """
+    Must match ratio_service.py output (Plan A):
+    coin, timestamp, long_ratio, short_ratio, long_short_ratio
+    """
     coin: str
     timestamp: datetime
-    long_ratio: Decimal
-    short_ratio: Decimal
-    long_position_value: Decimal
-    short_position_value: Decimal
-    total_position_value: Decimal
-    long_accounts: int
-    short_accounts: int
+    long_ratio: float
+    short_ratio: float
+    long_short_ratio: float
 
     class Config:
         from_attributes = True
@@ -86,7 +85,6 @@ class LongShortRatioResponse(BaseModel):
 # ========== Liquidation Map Schemas ==========
 
 class PriceLevelResponse(BaseModel):
-    """Price level in liquidation map"""
     price: Decimal
     long_liquidation_value: Decimal
     short_liquidation_value: Decimal
@@ -95,7 +93,6 @@ class PriceLevelResponse(BaseModel):
 
 
 class LiquidationMapResponse(BaseModel):
-    """Liquidation map response"""
     coin: str
     timestamp: datetime
     price_levels: List[PriceLevelResponse]
@@ -104,7 +101,6 @@ class LiquidationMapResponse(BaseModel):
 # ========== Transaction Schemas ==========
 
 class TransactionResponse(BaseModel):
-    """Transaction response"""
     tx_hash: str
     block_number: int
     block_timestamp: datetime
@@ -117,7 +113,7 @@ class TransactionResponse(BaseModel):
     margin: Optional[Decimal] = None
     fee: Optional[Decimal] = None
     tx_type: Optional[str] = None
-    raw_data: Optional[dict] = None
+    raw_data: Optional[Dict[str, Any]] = None
 
     class Config:
         from_attributes = True
@@ -126,7 +122,6 @@ class TransactionResponse(BaseModel):
 # ========== Whale Schemas ==========
 
 class WhaleWatchResponse(BaseModel):
-    """Whale watch response"""
     id: int
     wallet_address: str
     alias: Optional[str] = None
@@ -139,14 +134,12 @@ class WhaleWatchResponse(BaseModel):
 
 
 class WhaleWatchCreate(BaseModel):
-    """Create whale watch request"""
     wallet_address: str
     alias: Optional[str] = None
     description: Optional[str] = None
 
 
 class WhaleActivityResponse(BaseModel):
-    """Whale activity response"""
     id: int
     whale_id: Optional[int] = None
     wallet_address: str
@@ -156,7 +149,7 @@ class WhaleActivityResponse(BaseModel):
     size: Optional[Decimal] = None
     value_usd: Optional[Decimal] = None
     timestamp: datetime
-    details: Optional[dict] = None
+    details: Optional[Dict[str, Any]] = None
 
     class Config:
         from_attributes = True

@@ -12,40 +12,52 @@ import uvicorn
 from config import settings
 
 # Import routers
-from routers import liquidations, ratios, liquidation_map, transactions, whales, websocket
-from routers import market, whale, wallet
+from routers import (
+    liquidations,
+    ratios,
+    liquidation_map,
+    transactions,
+    whales,
+    websocket,
+    market,
+    whale,
+    wallet,
+)
 
 from kafka_consumer import kafka_consumer
 
-# Logging setup (make logs visible in docker logs)
+
+# ---------------- Logging ----------------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("app")
 
 
+# ---------------- Lifespan ----------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Lifespan context manager for startup and shutdown"""
+    """Startup & shutdown lifecycle"""
     logger.info("[App] Starting Backend service...")
 
-    # Get the running event loop for scheduling async tasks from consumer thread
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
         loop = asyncio.get_event_loop()
 
+    # start kafka consumer
     kafka_consumer.set_main_loop(loop)
     kafka_consumer.start()
 
-    logger.info(f"[App] Backend service started on {settings.server_host}:{settings.server_port}")
-
+    logger.info(
+        f"[App] Backend started on {settings.server_host}:{settings.server_port}"
+    )
     yield
 
     logger.info("[App] Shutting down Backend service...")
     kafka_consumer.stop()
-    logger.info("[App] Backend service stopped")
+    logger.info("[App] Backend stopped")
 
 
-# Create FastAPI app
+# ---------------- Create FastAPI app ----------------
 app = FastAPI(
     title="Hyperliquid Data Analysis API",
     description="Backend API for Hyperliquid perpetual order data analysis",
@@ -53,34 +65,38 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# CORS middleware
+
+# ---------------- CORS ----------------
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, specify allowed origins
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Include routers - Frontend-compatible routes
+
+# ================= ROUTERS =================
+
+# -------- Frontend-compatible routes --------
 app.include_router(market.router, prefix=settings.api_prefix)
 app.include_router(whale.router, prefix=settings.api_prefix)
 app.include_router(wallet.router, prefix=settings.api_prefix)
 
-# Legacy routes (for backward compatibility, can be removed later)
+# -------- Core data routes --------
 app.include_router(liquidations.router, prefix=settings.api_prefix)
 app.include_router(ratios.router, prefix=settings.api_prefix)
-app.include_router(liquidation_map.router, prefix=settings.api_prefix)
+app.include_router(liquidation_map.router, prefix=settings.api_prefix)  # ⭐关键
 app.include_router(transactions.router, prefix=settings.api_prefix)
 app.include_router(whales.router, prefix=settings.api_prefix)
 
-# WebSocket router (no prefix needed, already includes /api/v1/ws)
+# -------- WebSocket --------
 app.include_router(websocket.router)
 
 
+# ================= BASIC ENDPOINTS =================
 @app.get("/")
 async def root():
-    """Root endpoint"""
     return {
         "message": "Hyperliquid Data Analysis API",
         "version": "1.0.0",
@@ -90,12 +106,11 @@ async def root():
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint"""
     return {"status": "healthy"}
 
 
+# ---------------- Local run ----------------
 if __name__ == "__main__":
-    # Local run (no reload; keep it stable)
     uvicorn.run(
         "main:app",
         host=settings.server_host,

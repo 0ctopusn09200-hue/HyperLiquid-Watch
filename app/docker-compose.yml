@@ -28,7 +28,7 @@ services:
       KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
       KAFKA_LISTENERS: INTERNAL://0.0.0.0:9092,EXTERNAL://0.0.0.0:9093
-      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:9092,EXTERNAL://localhost:9092
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:9092,EXTERNAL://kafka:9092
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
       KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
@@ -143,10 +143,16 @@ services:
       - ave-net
     restart: unless-stopped
 
+    environment:
+      - API_INTERNAL_URL=http://backend:8080
+      - NEXT_PUBLIC_API_URL=http://localhost:8080
+
+
   # =========================
   # Computer  ⭐⭐⭐关键
   # =========================
   computer:
+    container_name: computer
     build:
       context: .
       dockerfile: computer/Dockerfile
